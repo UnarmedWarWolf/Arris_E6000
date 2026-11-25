@@ -20,6 +20,7 @@ What changed in 0.3.0 (rewrite of the 0.2.x Gemini build)
     fleet leaderboard, colour-coded triage + maintenance diff, history replay.
   * Fleet audit shares the bastion session (parallel channels, one VIP token).
   * Excel export uses the real column headers with health colouring; HTML export is escaped.
+  * 0.3.1: "Output -> Excel" saves the on-screen output (colours kept) to a location you choose.
   * Config + history live in ~/.e6000_command_center (old files are migrated).
 """
 
@@ -59,7 +60,7 @@ try:
 except ImportError:  # export is disabled gracefully
     openpyxl = None
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 APP_NAME = "E6000 Command Center"
 UI_FONT = "Segoe UI"
 MONO_FONT = "Consolas"
@@ -94,6 +95,7 @@ DEFAULT_SETTINGS: Dict[str, object] = {
     "auto_charts": False,
     "snapshot_cmds": ["show cable modem summary port mac | include mac", "show cable flap-list"],
     "term_max_lines": 60000,
+    "export_dir": "",              # last folder used by a Save dialog (remembered between runs)
 }
 
 # kind: min = higher is better, max = lower is better, window = inside [lo, hi] is best
@@ -2015,7 +2017,8 @@ class CommandCenter(ctk.CTk):
         acts = ctk.CTkFrame(tb, fg_color="transparent")
         acts.grid(row=0, column=2, sticky="e")
         for text, cmd in (("Find", self._open_find), ("Copy", self.copy_output), ("Ticket notes", self.copy_ticket),
-                          ("HTML report", self.export_html), ("Excel", self.export_excel), ("Clear", self.clear_terminal)):
+                          ("HTML report", self.export_html), ("Excel report", self.export_excel),
+                          ("Output → Excel", self.export_output_excel), ("Clear", self.clear_terminal)):
             self._btn(acts, text, cmd, "ghost", height=30).pack(side="left", padx=1)
 
         # View stack
@@ -2924,6 +2927,7 @@ class CommandCenter(ctk.CTk):
             menu.add_separator()
         menu.add_command(label="Copy line", command=lambda: (self.clipboard_clear(), self.clipboard_append(line)))
         menu.add_command(label="Copy ticket notes", command=self.copy_ticket)
+        menu.add_command(label="Export output to Excel...", command=self.export_output_excel)
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -3274,6 +3278,58 @@ class CommandCenter(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Export failed", str(e), parent=self)
 
+    def export_output_excel(self) -> None:
+        """Copy the on-screen output (Terminal, or the active Triage/Diff/Log/History view) to an .xlsx
+        file at a location the user picks. One worksheet row per line, colours preserved. If text is
+        selected, only the selection is exported."""
+        if openpyxl is None:
+            messagebox.showerror("Excel", "openpyxl is not installed (pip install openpyxl).", parent=self)
+            return
+        view = self.current_tab if self.current_tab in ("Triage", "Diff", "Log", "History") else "Terminal"
+        t = {"Triage": self.triage_text, "Diff": self.diff_text, "Log": self.log_text,
+             "History": self.hist_text}.get(view, self.term)
+        try:
+            start, end, scope = t.index("sel.first"), t.index("sel.last"), "selection"
+        except tk.TclError:
+            start, end, scope = "1.0", "end-1c", "all"
+        lines = text_widget_runs(t, start, end)
+        while lines and not "".join(s for s, _ in lines[-1]).strip():
+            lines.pop()
+        if not any("".join(s for s, _ in ln).strip() for ln in lines):
+            messagebox.showinfo("Export", f"The {view} view is empty - nothing to export.", parent=self)
+            return
+        host = self.connected_host or (self.results[-1].host if self.results else "") or "E6000"
+        init_dir = self.st.get("export_dir") or ""
+        if not init_dir or not Path(init_dir).is_dir():
+            init_dir = str(Path.home())
+        path = filedialog.asksaveasfilename(
+            parent=self, title=f"Save {view.lower()} output as Excel", defaultextension=".xlsx",
+            initialdir=init_dir, initialfile=f"E6000_{host}_{view.lower()}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            filetypes=[("Excel workbook", "*.xlsx")])
+        if not path:
+            return
+        self.st["export_dir"] = str(Path(path).parent)
+        meta = {"view": view, "host": host, "scope": scope}
+        self._set_activity(f"Exporting {len(lines):,} lines to Excel...", "warn")
+
+        def job():
+            try:
+                build_output_workbook(lines, meta).save(path)
+            except PermissionError:
+                self.ui(messagebox.showerror, "Export failed",
+                        f"Could not write to:\n{path}\n\nIs the file open in Excel? Close it and try again.")
+                self.ui(self._set_activity, "Excel export failed - file in use or no write access.", "crit")
+                return
+            except Exception as e:
+                self.ui(messagebox.showerror, "Export failed", str(e))
+                self.ui(self._set_activity, f"Excel export failed: {e}", "crit")
+                return
+            what = "selected lines" if scope == "selection" else "lines"
+            self.ui(self._set_activity, f"Exported {len(lines):,} {what} to {path}", "ok")
+            self.log(f"{view} output saved to Excel: {path}")
+
+        threading.Thread(target=job, daemon=True).start()
+
     # ------------------------------------------------------------------ settings
     def open_settings(self) -> None:
         SettingsDialog(self)
@@ -3598,6 +3654,92 @@ def build_workbook(app: CommandCenter):
                 write_table(sheet(base if len(tabs) == 1 else f"{base} t{i}"), f"{r.host} - {r.cmd}", t)
         else:
             write_raw(sheet(base), f"{r.host} - {r.cmd}", r.output)
+    return wb
+
+
+# Colour tags that carry meaning in exported output (search highlights / selection are ignored).
+_EXPORT_TAGS = ("crit", "warn", "ok", "add", "del", "mac", "ip", "iface", "th", "hdr", "cmd", "prompt", "dim")
+
+
+def text_widget_runs(t: tk.Text, start: str, end: str) -> List[List[Tuple[str, Optional[str]]]]:
+    """Read a Text widget range as lines of (text, colour_tag) runs, exactly as shown on screen."""
+    active: List[str] = []
+    lines: List[List[Tuple[str, Optional[str]]]] = [[]]
+    for kind, value, _ in t.dump(start, end, text=True, tag=True):
+        if kind == "tagon":
+            if value in _EXPORT_TAGS:
+                active.append(value)
+        elif kind == "tagoff":
+            if value in active:
+                active.remove(value)
+        elif kind == "text":
+            tag = next((x for x in _EXPORT_TAGS if x in active), None)  # highest-priority tag wins
+            parts = value.split("\n")
+            for i, part in enumerate(parts):
+                if i:
+                    lines.append([])
+                if part:
+                    cur = lines[-1]
+                    if cur and cur[-1][1] == tag:  # merge runs split by highlight/selection tags
+                        cur[-1] = (cur[-1][0] + part, tag)
+                    else:
+                        cur.append((part, tag))
+    if lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def build_output_workbook(lines: List[List[Tuple[str, Optional[str]]]], meta: dict):
+    """Terminal-style workbook: one row per output line in a monospace font, keeping the app's colour
+    coding (Daylight palette so it reads on Excel's white background)."""
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    from openpyxl.cell.rich_text import CellRichText, TextBlock
+    from openpyxl.cell.text import InlineFont
+
+    P = THEMES["Daylight"]
+    colour = {"crit": P["crit"], "warn": P["warn"], "ok": P["ok"], "add": P["ok"], "del": P["crit"],
+              "mac": P["mac"], "ip": P["ip"], "iface": P["iface"], "th": P["th"], "hdr": P["accent"],
+              "cmd": P["text"], "prompt": P["muted"], "dim": P["dim"]}
+    bold = {"crit", "warn", "th", "hdr", "cmd", "prompt"}
+    mono, size = "Consolas", 10
+    base_font = Font(name=mono, size=size, color="FF" + P["term_fg"].lstrip("#"))
+    inline: Dict[Optional[str], InlineFont] = {None: InlineFont(rFont=mono, sz=size, color="FF" + P["term_fg"].lstrip("#"))}
+    cell_font: Dict[Optional[str], Font] = {None: base_font}
+    for tag, hexc in colour.items():
+        argb = "FF" + hexc.lstrip("#")
+        inline[tag] = InlineFont(rFont=mono, sz=size, color=argb, b=tag in bold)
+        cell_font[tag] = Font(name=mono, size=size, color=argb, bold=tag in bold)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = re.sub(r"[\[\]:*?/\\]", "_", f"{meta['view']} output")[:31]
+    ws.append([f"E6000 {meta['view'].lower()} output - {meta['host']}"])
+    ws["A1"].font = Font(bold=True, size=13)
+    scope = "selected text" if meta.get("scope") == "selection" else "full view"
+    ws.append([f"Exported {datetime.now():%Y-%m-%d %H:%M:%S}  ·  {len(lines):,} lines ({scope})  ·  "
+               f"Command Center {VERSION}"])
+    ws["A2"].font = Font(italic=True, size=9, color="FF" + P["muted"].lstrip("#"))
+    first = 4  # row 3 left blank as a spacer
+    widest = 20
+    for n, runs in enumerate(lines, start=first):
+        runs = [(ILLEGAL_CHARACTERS_RE.sub("", s).replace("\t", "    "), tag) for s, tag in runs]
+        runs = [(s, tag) for s, tag in runs if s]
+        text = "".join(s for s, _ in runs)
+        widest = max(widest, len(text))
+        c = ws.cell(row=n, column=1)
+        if not runs:
+            continue
+        tags = {tag for _, tag in runs}
+        if len(tags) == 1:  # single colour -> plain cell, smaller file
+            c.value = text[:32767]
+            c.data_type = "s"  # never let a line starting with '=' become a formula
+            c.font = cell_font[runs[0][1]]
+        else:
+            c.value = CellRichText(*[TextBlock(inline[tag], s) for s, tag in runs])
+            c.font = base_font
+    ws.column_dimensions["A"].width = min(widest + 2, 255)
+    ws.freeze_panes = f"A{first}"
+    ws.sheet_view.zoomScale = 100
     return wb
 
 
