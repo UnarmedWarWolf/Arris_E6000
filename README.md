@@ -9,7 +9,7 @@ Operations console for ARRIS / CommScope E6000 CER chassis, reached directly ove
 ### Run
 
 ```
-pip install paramiko matplotlib openpyxl
+pip install customtkinter paramiko matplotlib openpyxl
 python CMTS_Command_Center.py
 ```
 
@@ -17,10 +17,16 @@ Settings and history are stored in `~/.e6000_command_center`.
 
 ### Build a Windows .exe
 
+Double-click `build.bat` (or run it from a command prompt in the repo folder). It creates a clean `.venv`, installs everything, and builds.
+
+Manual equivalent:
+
 ```
-pip install pyinstaller
-pyinstaller CMTS_Command_Center.spec
+pip install pyinstaller customtkinter paramiko matplotlib openpyxl
+pyinstaller --clean --noconfirm CMTS_Command_Center.spec
 ```
+
+If Windows Defender deletes the exe right after it's built, add an exclusion for the repo's `dist\` folder.
 
 The executable is written to `dist/`. Build output isn't committed to the repo. Publish the .exe as a GitHub Release instead.
 

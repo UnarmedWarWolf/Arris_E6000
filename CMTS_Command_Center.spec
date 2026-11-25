@@ -1,25 +1,38 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+# Build:  pyinstaller --clean --noconfirm CMTS_Command_Center.spec
+# (or just run build.bat, which sets up a clean venv first)
+from PyInstaller.utils.hooks import collect_data_files
 
-datas = []
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('customtkinter')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('matplotlib')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# customtkinter ships theme .json files and fonts that PyInstaller does not
+# pick up on its own. Without them the exe dies on launch.
+datas = collect_data_files('customtkinter')
 
+# matplotlib already has a built-in PyInstaller hook, so collect_all() is not
+# needed. collect_all() pulled in every backend (Qt, wx, GTK, WebAgg) and
+# fails with "multiple Qt bindings" on machines that have PyQt/PySide
+# installed (Anaconda, Spyder, etc.). The app only uses the Tk backend.
+hiddenimports = [
+    'matplotlib.backends.backend_tkagg',
+    'openpyxl.cell.rich_text',
+    'openpyxl.cell.text',
+]
+
+excludes = [
+    'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'qtpy',
+    'wx', 'gi', 'IPython', 'jupyter', 'notebook',
+    'matplotlib.tests', 'numpy.tests', 'pytest',
+]
 
 a = Analysis(
     ['CMTS_Command_Center.py'],
     pathex=[],
-    binaries=binaries,
+    binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     noarchive=False,
     optimize=0,
 )
@@ -35,7 +48,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX corrupts some Windows DLLs (vcruntime, Tcl/Tk, cryptography) and
+    # makes Defender far more likely to quarantine the exe. Keep it off.
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
