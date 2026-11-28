@@ -80,9 +80,16 @@ Name: "{group}\{#MyAppName}";       Filename: "{app}\{#MyAppExeName}"; WorkingDi
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; In-app updates run Setup with /SILENT /RELAUNCH=1, so reopen the app afterwards (as the user, not as admin)
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
 
 [Code]
+function RelaunchRequested: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
 // Settings, saved hosts and command history live in %USERPROFILE%\.e6000_command_center,
 // not in the install folder, so they survive upgrades. On uninstall, ask whether to
 // remove them too (default: keep).

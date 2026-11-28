@@ -2,7 +2,7 @@
 
 Projects for the ARRIS E6000 CMTS chassis.
 
-## CMTS Command Center (v0.3.2)
+## CMTS Command Center (v0.4.0)
 
 Operations console for ARRIS / CommScope E6000 CER chassis, reached directly over SSH or through a bastion (jump) host with a one-time VIP token.
 
@@ -23,6 +23,7 @@ Download `CMTS_Command_Center_Setup_<version>.exe` from [Releases](https://githu
 - Adds a Start Menu entry and, unless you untick it, a desktop shortcut.
 - Can install for all users (needs admin) or for just you (no admin; goes to `%LOCALAPPDATA%\Programs`).
 - Upgrades an existing install in place. Your settings and history are kept.
+- Updates itself: on startup the app checks GitHub Releases. When a newer version is out, it offers to download and install it, then reopens. You can turn this off or check manually in **Settings → Updates**.
 - Appears in **Settings → Apps** for uninstall. Uninstall asks whether to also delete your settings and history (default: keep).
 
 ### Build the installer
@@ -38,13 +39,15 @@ This installs the build dependencies, runs PyInstaller (`dist\CMTS_Command_Cente
 To build it on GitHub instead, push a version tag. The **Build Windows installer** workflow builds the setup .exe and attaches it to a Release:
 
 ```
-git tag v0.3.2
-git push origin v0.3.2
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 Build output isn't committed to the repo.
 
-### What's new in 0.3.2
+### What's new in 0.4.0
+- **Update check.** On startup the app asks GitHub for the latest release. If it's newer, you see what's new and can **Install now**, **Skip this version** or choose **Later**. An **Update to vX** button stays in the top bar until you update. Install now downloads the setup file, checks its SHA-256 against GitHub, runs it silently (with a UAC prompt for an all-users install), and reopens the app.
+- If GitHub is unreachable (for example, blocked on the work network), the automatic check fails silently. **Settings → Updates → Check now** shows the reason.
 - Windows installer (Inno Setup) with install-location choice, desktop and Start Menu shortcuts, and an uninstaller.
 - App icon on the .exe, window and taskbar.
 - PyInstaller now produces a folder build, which starts faster than the old one-file .exe.
