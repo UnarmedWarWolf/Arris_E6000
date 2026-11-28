@@ -29,17 +29,24 @@ from __future__ import annotations
 import base64
 import codecs
 import difflib
+import hashlib
 import html
 import io
 import json
+import os
 import queue
 import re
 import shutil
 import socket
 import sqlite3
+import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from bisect import bisect_right
 from collections import Counter, deque
@@ -60,7 +67,7 @@ try:
 except ImportError:  # export is disabled gracefully
     openpyxl = None
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 APP_NAME = "E6000 Command Center"
 UI_FONT = "Segoe UI"
 MONO_FONT = "Consolas"
@@ -71,6 +78,93 @@ MONO_FONT = "Consolas"
 APP_DIR = Path.home() / ".e6000_command_center"
 CONFIG_FILE = APP_DIR / "config.json"
 DB_FILE = APP_DIR / "flight_recorder.db"
+
+
+def resource_path(name: str) -> Path:
+    """Locate a bundled file (e.g. assets/app.ico) both from source and from a PyInstaller build."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / name
+
+
+# =============================================================================
+# Updates (GitHub Releases)
+# =============================================================================
+UPDATE_REPO = "UnarmedWarWolf/Arris_E6000"
+INSTALLER_APP_ID = "{4F179285-DA2E-4602-9D5C-3C2CAA698454}"   # AppId in installer/CMTS_Command_Center.iss
+_SETUP_ASSET_RE = re.compile(r"^CMTS_Command_Center_Setup_.*\.exe$", re.I)
+_HTTP_HEADERS = {"User-Agent": f"CMTS-Command-Center/{VERSION}", "Accept": "application/vnd.github+json"}
+
+
+def version_tuple(v: str) -> Tuple[int, ...]:
+    """'v0.4.1' -> (0, 4, 1). Anything after the numbers (e.g. '-beta') is ignored."""
+    m = re.match(r"\s*v?(\d+(?:\.\d+)*)", str(v or ""))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
+
+
+def fetch_latest_release(timeout: float = 8.0) -> dict:
+    """Newest published (non-draft, non-prerelease) release from GitHub.
+
+    Uses the REST API, which gives release notes and a SHA-256 for the installer. If the API refuses
+    (60 requests/hour per IP without a token - easy to hit behind a shared office NAT), falls back to
+    following the /releases/latest redirect and the installer's predictable download URL.
+    Raises on network errors; the caller decides whether to show them."""
+    api = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(api, headers=_HTTP_HEADERS), timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        tag = str(data.get("tag_name") or "")
+        info = {"version": tag.lstrip("vV"), "tag": tag, "name": data.get("name") or tag,
+                "notes": (data.get("body") or "").strip(), "page": data.get("html_url") or "",
+                "published": (data.get("published_at") or "")[:10], "asset_url": "", "asset_name": "",
+                "size": 0, "sha256": ""}
+        for a in data.get("assets") or []:
+            if _SETUP_ASSET_RE.match(str(a.get("name") or "")):
+                digest = str(a.get("digest") or "")
+                info.update(asset_url=a.get("browser_download_url") or "", asset_name=a["name"],
+                            size=int(a.get("size") or 0),
+                            sha256=digest[7:].lower() if digest.lower().startswith("sha256:") else "")
+                break
+        return info
+    except urllib.error.HTTPError as e:
+        if e.code not in (403, 429):
+            raise
+    # Fallback: github.com/<repo>/releases/latest redirects to .../releases/tag/<tag>
+    page = f"https://github.com/{UPDATE_REPO}/releases/latest"
+    with urllib.request.urlopen(urllib.request.Request(page, headers={"User-Agent": _HTTP_HEADERS["User-Agent"]}),
+                                timeout=timeout) as r:
+        final = r.geturl()
+    m = re.search(r"/releases/tag/([^/?#]+)", final)
+    if not m:
+        raise RuntimeError("No published release found.")
+    tag = urllib.parse.unquote(m.group(1))
+    ver = tag.lstrip("vV")
+    name = f"CMTS_Command_Center_Setup_{ver}.exe"
+    return {"version": ver, "tag": tag, "name": tag, "notes": "", "page": final, "published": "",
+            "asset_url": f"https://github.com/{UPDATE_REPO}/releases/download/{tag}/{name}", "asset_name": name,
+            "size": 0, "sha256": ""}
+
+
+def installed_scope() -> str:
+    """'/ALLUSERS' or '/CURRENTUSER' to match how the current copy was installed, or '' if unknown."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+        key = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{INSTALLER_APP_ID}_is1"
+        for hive, flag in ((winreg.HKEY_CURRENT_USER, "/CURRENTUSER"), (winreg.HKEY_LOCAL_MACHINE, "/ALLUSERS")):
+            try:
+                winreg.CloseKey(winreg.OpenKey(hive, key, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY))
+                return flag
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+def can_self_update() -> bool:
+    """Only an installed Windows build can run the installer over itself. From source, we just link to the page."""
+    return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
 
 
 def _migrate_legacy_files() -> None:
@@ -96,6 +190,8 @@ DEFAULT_SETTINGS: Dict[str, object] = {
     "snapshot_cmds": ["show cable modem summary port mac | include mac", "show cable flap-list"],
     "term_max_lines": 60000,
     "export_dir": "",              # last folder used by a Save dialog (remembered between runs)
+    "check_updates": True,         # ask GitHub for a newer release when the app starts
+    "skip_version": "",            # a release the user chose to skip
 }
 
 # kind: min = higher is better, max = lower is better, window = inside [lo, hi] is best
@@ -1630,6 +1726,12 @@ class CommandCenter(ctk.CTk):
         self.P = THEMES.get(str(self.st["theme"]), THEMES["Midnight"])
         ctk.set_appearance_mode(self.P["mode"])
         self.title(f"{APP_NAME}  {VERSION}")
+        try:
+            ico = resource_path("assets/app.ico")
+            if ico.is_file():
+                self.iconbitmap(default=str(ico))
+        except Exception:
+            pass
         self.geometry("1520x930")
         self.minsize(1180, 720)
 
@@ -1669,6 +1771,9 @@ class CommandCenter(ctk.CTk):
         self.find_idx = -1
         self.current_tab = "Terminal"
         self.skip_confirm = False
+        self.update_info: Optional[dict] = None
+        self._update_checking = False
+        self._update_dialog = None
 
         self._build_ui()
         threading.Thread(target=self._job_loop, daemon=True).start()
@@ -1676,6 +1781,8 @@ class CommandCenter(ctk.CTk):
         self.after(4000, self._monitor_connection)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.log(f"{APP_NAME} {VERSION} ready. Config: {APP_DIR}")
+        if self.st.get("check_updates", True) and not SELFTEST:
+            self.after(3000, lambda: self.check_for_updates(manual=False))
 
     # ------------------------------------------------------------------ threading helpers
     def ui(self, fn: Callable, *args) -> None:
@@ -1883,7 +1990,10 @@ class CommandCenter(ctk.CTk):
         self.conn_dot.pack(side="left", padx=(10, 4), pady=3)
         self.conn_lbl = self._label(pill, "Not connected", 12, color=P["muted"])
         self.conn_lbl.pack(side="left", padx=(0, 12), pady=3)
-        self._btn(right, "Settings", self.open_settings, "secondary", width=84).pack(side="left")
+        self.update_btn = self._btn(right, "Update available", self.open_update_dialog, "primary", width=150)
+        self.settings_btn = self._btn(right, "Settings", self.open_settings, "secondary", width=84)
+        self.settings_btn.pack(side="left")
+        self._refresh_update_btn()
 
     def _build_sidebar(self) -> None:
         P = self.P
@@ -3228,16 +3338,27 @@ class CommandCenter(ctk.CTk):
         self.clipboard_append("\n".join(lines))
         self._set_activity("Ticket notes copied to clipboard (Markdown).", "ok")
 
+    def _export_initial_dir(self) -> str:
+        """Last export folder, else Documents, else home. Never the install folder:
+        when installed under Program Files the working directory isn't writable."""
+        d = str(self.st.get("export_dir") or "")
+        if d and Path(d).is_dir():
+            return d
+        docs = Path.home() / "Documents"
+        return str(docs if docs.is_dir() else Path.home())
+
     def export_html(self) -> None:
         if not self.results and not self.fleet_rows:
             messagebox.showinfo("Export", "Nothing to export yet.", parent=self)
             return
         host = self.results[-1].host if self.results else "fleet"
         path = filedialog.asksaveasfilename(parent=self, title="Save HTML report", defaultextension=".html",
+                                            initialdir=self._export_initial_dir(),
                                             initialfile=f"E6000_{host}_{datetime.now():%Y%m%d_%H%M%S}.html",
                                             filetypes=[("HTML", "*.html")])
         if not path:
             return
+        self.st["export_dir"] = str(Path(path).parent)
         img = ""
         if self.fig is not None or self.last_parsed:
             try:
@@ -3267,10 +3388,12 @@ class CommandCenter(ctk.CTk):
             return
         host = self.results[-1].host if self.results else "fleet"
         path = filedialog.asksaveasfilename(parent=self, title="Save workbook", defaultextension=".xlsx",
+                                            initialdir=self._export_initial_dir(),
                                             initialfile=f"E6000_{host}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
                                             filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
+        self.st["export_dir"] = str(Path(path).parent)
         try:
             build_workbook(self).save(path)
             self._set_activity(f"Workbook saved: {path}", "ok")
@@ -3299,12 +3422,9 @@ class CommandCenter(ctk.CTk):
             messagebox.showinfo("Export", f"The {view} view is empty - nothing to export.", parent=self)
             return
         host = self.connected_host or (self.results[-1].host if self.results else "") or "E6000"
-        init_dir = self.st.get("export_dir") or ""
-        if not init_dir or not Path(init_dir).is_dir():
-            init_dir = str(Path.home())
         path = filedialog.asksaveasfilename(
             parent=self, title=f"Save {view.lower()} output as Excel", defaultextension=".xlsx",
-            initialdir=init_dir, initialfile=f"E6000_{host}_{view.lower()}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            initialdir=self._export_initial_dir(), initialfile=f"E6000_{host}_{view.lower()}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
             filetypes=[("Excel workbook", "*.xlsx")])
         if not path:
             return
@@ -3333,6 +3453,81 @@ class CommandCenter(ctk.CTk):
     # ------------------------------------------------------------------ settings
     def open_settings(self) -> None:
         SettingsDialog(self)
+
+    # ------------------------------------------------------------------ updates
+    def check_for_updates(self, manual: bool = False) -> None:
+        """Ask GitHub for the newest release in the background. Automatic checks stay quiet on errors."""
+        if self._update_checking:
+            return
+        self._update_checking = True
+        if manual:
+            self._set_activity("Checking for updates...", "warn")
+
+        def job():
+            info, err = None, None
+            try:
+                info = fetch_latest_release()
+            except Exception as e:
+                err = e
+            self.ui(self._on_update_result, info, err, manual)
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _on_update_result(self, info: Optional[dict], err: Optional[Exception], manual: bool) -> None:
+        self._update_checking = False
+        if err is not None or not info or not info.get("version"):
+            reason = (f"HTTP {err.code}" if isinstance(err, urllib.error.HTTPError)
+                      else str(getattr(err, "reason", None) or err or "no release published"))
+            self.log(f"Update check failed: {reason}")
+            if manual:
+                self._set_activity("Update check failed.", "crit")
+                messagebox.showerror("Check for updates",
+                                     f"Couldn't check for updates.\n\n{reason}\n\n"
+                                     f"GitHub may be blocked on this network. You can download new versions from\n"
+                                     f"https://github.com/{UPDATE_REPO}/releases", parent=self)
+            return
+        newer = version_tuple(info["version"]) > version_tuple(VERSION)
+        if not newer:
+            self.update_info = None
+            self._refresh_update_btn()
+            if manual:
+                self._set_activity(f"You're on the latest version (v{VERSION}).", "ok")
+                messagebox.showinfo("Check for updates", f"You're on the latest version (v{VERSION}).", parent=self)
+            return
+        self.update_info = info
+        self.log(f"Update available: v{info['version']} (you have v{VERSION}).")
+        skipped = str(self.st.get("skip_version") or "") == info["version"]
+        self._refresh_update_btn()
+        if manual or not skipped:
+            self.open_update_dialog()
+
+    def _refresh_update_btn(self) -> None:
+        btn = getattr(self, "update_btn", None)
+        if btn is None:
+            return
+        info = self.update_info
+        show = bool(info) and str(self.st.get("skip_version") or "") != info["version"]
+        if show:
+            btn.configure(text=f"Update to v{info['version']}")
+            btn.pack(side="left", padx=(0, 10), before=self.settings_btn)
+        else:
+            btn.pack_forget()
+
+    def open_update_dialog(self) -> None:
+        if not self.update_info:
+            return
+        dlg = self._update_dialog
+        if dlg is not None and dlg.winfo_exists():
+            dlg.lift()
+            dlg.focus_force()
+            return
+        self._update_dialog = UpdateDialog(self, self.update_info)
+
+    def skip_update(self, version: str) -> None:
+        self.st["skip_version"] = version
+        self._save_config()
+        self._refresh_update_btn()
+        self.log(f"Skipping v{version}. Check for updates in Settings to see it again.")
 
     def apply_settings(self, st: dict, th: Dict[str, dict]) -> None:
         theme_changed = st["theme"] != self.st["theme"]
@@ -3404,6 +3599,9 @@ class CommandCenter(ctk.CTk):
         })
 
     def _on_close(self) -> None:
+        dlg = getattr(self, "_update_dialog", None)
+        if dlg is not None:
+            dlg.cancelled = True
         self.watching = False
         self.cancel_event.set()
         try:
@@ -3800,6 +3998,17 @@ class SettingsDialog(ctk.CTkToplevel):
         self.snap.insert("1.0", "\n".join(st["snapshot_cmds"]))
         self.snap.pack(fill="x")
 
+        s = section("Updates")
+        self.chk_upd = tk.BooleanVar(value=bool(st.get("check_updates", True)))
+        ctk.CTkSwitch(s, text="Check for updates when the app starts", variable=self.chk_upd, font=app.F(12),
+                      text_color=P["text"], progress_color=P["accent"], button_color=P["text"],
+                      fg_color=P["border"]).pack(anchor="w", pady=3)
+        row = ctk.CTkFrame(s, fg_color="transparent")
+        row.pack(fill="x", pady=(4, 0))
+        app._btn(row, "Check now", self._check_now, "secondary", width=110).pack(side="left")
+        app._label(row, f"Installed: v{VERSION}   ·   Releases: github.com/{UPDATE_REPO}", 11,
+                   color=P["muted"]).pack(side="left", padx=10)
+
         s = section("Colour thresholds")
         app._label(s, "Good = green, between good and marginal = amber, beyond marginal = red. "
                       "Window metrics take 'low, high'.", 11, color=P["muted"], wraplength=640, justify="left").pack(anchor="w")
@@ -3824,6 +4033,10 @@ class SettingsDialog(ctk.CTkToplevel):
         app._btn(foot, "Reset thresholds", self._reset_th, "ghost").pack(side="left")
         app._btn(foot, "Save", self._save, "primary", width=100).pack(side="right")
         app._btn(foot, "Cancel", self.destroy, "secondary", width=90).pack(side="right", padx=8)
+
+    def _check_now(self):
+        self.app.st["skip_version"] = ""     # a manual check shows a previously skipped version again
+        self.app.check_for_updates(manual=True)
 
     def _num(self, parent, label, value, col):
         f = ctk.CTkFrame(parent, fg_color="transparent")
@@ -3865,6 +4078,8 @@ class SettingsDialog(ctk.CTkToplevel):
                 "snapshot_cmds": [x.strip() for x in self.snap.get("1.0", "end").splitlines() if x.strip()],
                 "confirm_disruptive": bool(self.confirm.get()),
                 "auto_charts": bool(self.autoch.get()),
+                "check_updates": bool(self.chk_upd.get()),
+                "skip_version": app.st.get("skip_version", ""),
             })
         except Exception as e:
             messagebox.showerror("Invalid value", f"Please check the numbers you entered.\n\n{e}", parent=self)
@@ -3873,6 +4088,231 @@ class SettingsDialog(ctk.CTkToplevel):
         app.apply_settings(st, th)
 
 
-if __name__ == "__main__":
+class UpdateDialog(ctk.CTkToplevel):
+    """Shows a newer release and, on an installed Windows build, downloads and runs its installer."""
+
+    def __init__(self, app: CommandCenter, info: dict):
+        super().__init__(app)
+        self.app = app
+        self.info = info
+        self.cancelled = False
+        self.downloading = False
+        P = app.P
+        self.title("Update available")
+        self.geometry("620x520")
+        self.minsize(520, 420)
+        self.configure(fg_color=P["bg"])
+        self.transient(app)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.pack(fill="x", padx=20, pady=(18, 6))
+        app._label(head, f"Version {info['version']} is available", 17, "bold").pack(anchor="w")
+        sub = f"You have v{VERSION}."
+        if info.get("published"):
+            sub += f"  Released {info['published']}."
+        app._label(head, sub, 12, color=P["muted"]).pack(anchor="w", pady=(2, 0))
+
+        app._label(self, "WHAT'S NEW", 10, "bold", P["muted"]).pack(anchor="w", padx=20, pady=(8, 2))
+        notes = ctk.CTkTextbox(self, fg_color=P["card"], border_color=P["border"], border_width=1,
+                               text_color=P["text"], font=app.F(12), wrap="word")
+        notes.insert("1.0", info.get("notes") or "No release notes were published for this version.")
+        notes.configure(state="disabled")
+        notes.pack(fill="both", expand=True, padx=20)
+
+        self.prog = ctk.CTkProgressBar(self, progress_color=P["accent"], fg_color=P["border"], height=8)
+        self.prog.set(0)
+        self.status = app._label(self, "", 11, color=P["muted"], anchor="w")
+        self.status.pack(fill="x", padx=20, pady=(8, 0))
+
+        foot = ctk.CTkFrame(self, fg_color="transparent")
+        foot.pack(fill="x", padx=20, pady=14)
+        self.self_update = can_self_update() and bool(info.get("asset_url"))
+        self.install_btn = app._btn(foot, "Install now" if self.self_update else "Open download page",
+                                    self._install, "primary", width=150)
+        self.install_btn.pack(side="right")
+        self.later_btn = app._btn(foot, "Later", self._close, "secondary", width=80)
+        self.later_btn.pack(side="right", padx=8)
+        self.skip_btn = app._btn(foot, "Skip this version", self._skip, "ghost")
+        self.skip_btn.pack(side="left")
+        if info.get("page"):
+            app._btn(foot, "Release page", lambda: webbrowser.open(info["page"]), "ghost").pack(side="left")
+        self.after(80, self.lift)
+
+    def _close(self):
+        self.cancelled = True
+        self.app._update_dialog = None
+        self.destroy()
+
+    def _skip(self):
+        self.app.skip_update(self.info["version"])
+        self._close()
+
+    def _install(self):
+        if not self.self_update:
+            webbrowser.open(self.info.get("page") or f"https://github.com/{UPDATE_REPO}/releases/latest")
+            return
+        if not messagebox.askokcancel(
+                "Install update",
+                f"The update will download, then this app closes and v{self.info['version']} installs.\n"
+                "Open CMTS sessions will be disconnected. The app reopens when it's done.\n\n"
+                "Your settings and history are kept.", parent=self):
+            return
+        self.downloading = True
+        for b in (self.install_btn, self.skip_btn):
+            b.configure(state="disabled")
+        self.later_btn.configure(text="Cancel")
+        self.prog.pack(fill="x", padx=20, pady=(8, 0), before=self.status)
+        self.status.configure(text="Downloading...")
+        threading.Thread(target=self._download, daemon=True).start()
+
+    def _ui(self, fn, *args):
+        if not self.cancelled:
+            self.app.ui(lambda: self.winfo_exists() and fn(*args))
+
+    def _download(self):
+        info = self.info
+        dest_dir = Path(tempfile.gettempdir()) / "CMTS_Command_Center_Update"
+        dest = dest_dir / info["asset_name"]
+        part = dest.with_suffix(".part")
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for old in dest_dir.iterdir():          # installers left over from earlier updates
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            req = urllib.request.Request(info["asset_url"], headers={"User-Agent": _HTTP_HEADERS["User-Agent"]})
+            h = hashlib.sha256()
+            got, last = 0, 0.0
+            with urllib.request.urlopen(req, timeout=30) as r, open(part, "wb") as f:
+                total = int(r.headers.get("Content-Length") or info.get("size") or 0)
+                while True:
+                    if self.cancelled:
+                        raise InterruptedError
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    got += len(chunk)
+                    now = time.monotonic()
+                    if now - last > 0.1:
+                        last = now
+                        self._ui(self._progress, got, total)
+            if info.get("size") and got != info["size"]:
+                raise IOError(f"Download incomplete ({got:,} of {info['size']:,} bytes).")
+            if info.get("sha256") and h.hexdigest() != info["sha256"]:
+                raise IOError("Downloaded file failed the SHA-256 check. It was not run.")
+            if got < 1_000_000:
+                raise IOError("Downloaded file is too small to be the installer.")
+            os.replace(part, dest)
+            self._ui(self._launch, dest)
+        except InterruptedError:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        except Exception as e:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            self._ui(self._failed, f"Download failed: {getattr(e, 'reason', None) or e}")
+
+    def _progress(self, got: int, total: int):
+        if total:
+            self.prog.set(min(1.0, got / total))
+            self.status.configure(text=f"Downloading... {got / 1e6:.1f} of {total / 1e6:.1f} MB")
+        else:
+            self.status.configure(text=f"Downloading... {got / 1e6:.1f} MB")
+
+    def _failed(self, msg: str):
+        self.downloading = False
+        self.prog.pack_forget()
+        self.status.configure(text=msg, text_color=self.app.P["crit"])
+        for b in (self.install_btn, self.skip_btn):
+            b.configure(state="normal")
+        self.later_btn.configure(text="Later")
+
+    def _launch(self, path: Path):
+        self.prog.set(1)
+        self.status.configure(text="Starting the installer...")
+        args = ["/SILENT", "/CLOSEAPPLICATIONS", "/RELAUNCH=1"]
+        scope = installed_scope()
+        if scope:
+            args.append(scope)
+        try:
+            # ShellExecute (not subprocess) so Windows shows the UAC prompt for an all-users install
+            os.startfile(str(path), "open", " ".join(args), str(path.parent))
+        except OSError as e:
+            if getattr(e, "winerror", None) == 1223:      # user said No at the UAC prompt
+                self._failed("Update cancelled at the Windows permission prompt.")
+            else:
+                self._failed(f"Couldn't start the installer: {e}")
+            return
+        self.app.log(f"Installing v{self.info['version']}. The app will reopen when it's done.")
+        self.cancelled = True
+        self.app._on_close()
+
+
+def run_selftest(out_path: str) -> None:
+    """Build/CI smoke test: `CMTS_Command_Center.exe --selftest result.json`.
+
+    Builds the full UI, opens and closes the Settings and Update dialogs, checks that GitHub is
+    reachable over HTTPS from the frozen app (certificates, proxy), writes a JSON report and exits.
+    Exit code 0 = pass. An unhandled error shows PyInstaller's error box instead, which CI catches
+    as a timeout."""
+    global SELFTEST
+    SELFTEST = True
+    report: dict = {"version": VERSION, "frozen": bool(getattr(sys, "frozen", False)), "checks": {}}
     app = CommandCenter()
+
+    def finish(ok: bool) -> None:
+        report["ok"] = ok
+        Path(out_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        app._on_close()
+        app.after(600, lambda: os._exit(0 if ok else 1))
+
+    def step() -> None:
+        c = report["checks"]
+        try:
+            c["icon_bundled"] = resource_path("assets/app.ico").is_file()
+            app.update_idletasks()
+            c["main_window"] = bool(app.winfo_exists()) and app.title().endswith(VERSION)
+            dlg = SettingsDialog(app)
+            app.update_idletasks()
+            dlg.destroy()
+            c["settings_dialog"] = True
+            fake = {"version": "99.0.0", "tag": "v99.0.0", "name": "v99.0.0", "notes": "self-test",
+                    "page": "", "published": "", "asset_url": "", "asset_name": "", "size": 0, "sha256": ""}
+            ud = UpdateDialog(app, fake)
+            app.update_idletasks()
+            ud._close()
+            c["update_dialog"] = True
+            try:
+                rel = fetch_latest_release(timeout=15)
+                c["github_https"] = f"ok, latest release {rel.get('tag')}"
+            except urllib.error.HTTPError as e:      # reached GitHub; e.g. 404 before the first release
+                c["github_https"] = f"ok, HTTP {e.code}"
+            except Exception as e:
+                c["github_https"] = f"FAILED: {e!r}"
+            ok = all(v is True for k, v in c.items() if k != "github_https") and \
+                str(c["github_https"]).startswith("ok")
+            finish(ok)
+        except Exception as e:
+            report["error"] = repr(e)
+            finish(False)
+
+    app.after(2500, step)
     app.mainloop()
+
+
+SELFTEST = False
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
+        run_selftest(sys.argv[2])
+    else:
+        app = CommandCenter()
+        app.mainloop()

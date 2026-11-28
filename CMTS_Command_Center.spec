@@ -1,7 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Builds a folder app (dist/CMTS_Command_Center/) for the installer.
+# A folder build starts faster than a one-file .exe (nothing to unpack to %TEMP%
+# on every launch) and is less likely to be flagged by antivirus.
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('assets/app.ico', 'assets')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('customtkinter')
@@ -28,20 +31,28 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='CMTS_Command_Center',
+    icon='assets/app.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='CMTS_Command_Center',
 )
