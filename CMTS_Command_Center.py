@@ -37,6 +37,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import sys
 import threading
 import time
 import tkinter as tk
@@ -60,7 +61,7 @@ try:
 except ImportError:  # export is disabled gracefully
     openpyxl = None
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 APP_NAME = "E6000 Command Center"
 UI_FONT = "Segoe UI"
 MONO_FONT = "Consolas"
@@ -71,6 +72,12 @@ MONO_FONT = "Consolas"
 APP_DIR = Path.home() / ".e6000_command_center"
 CONFIG_FILE = APP_DIR / "config.json"
 DB_FILE = APP_DIR / "flight_recorder.db"
+
+
+def resource_path(name: str) -> Path:
+    """Locate a bundled file (e.g. assets/app.ico) both from source and from a PyInstaller build."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / name
 
 
 def _migrate_legacy_files() -> None:
@@ -1630,6 +1637,12 @@ class CommandCenter(ctk.CTk):
         self.P = THEMES.get(str(self.st["theme"]), THEMES["Midnight"])
         ctk.set_appearance_mode(self.P["mode"])
         self.title(f"{APP_NAME}  {VERSION}")
+        try:
+            ico = resource_path("assets/app.ico")
+            if ico.is_file():
+                self.iconbitmap(default=str(ico))
+        except Exception:
+            pass
         self.geometry("1520x930")
         self.minsize(1180, 720)
 
@@ -3228,16 +3241,27 @@ class CommandCenter(ctk.CTk):
         self.clipboard_append("\n".join(lines))
         self._set_activity("Ticket notes copied to clipboard (Markdown).", "ok")
 
+    def _export_initial_dir(self) -> str:
+        """Last export folder, else Documents, else home. Never the install folder:
+        when installed under Program Files the working directory isn't writable."""
+        d = str(self.st.get("export_dir") or "")
+        if d and Path(d).is_dir():
+            return d
+        docs = Path.home() / "Documents"
+        return str(docs if docs.is_dir() else Path.home())
+
     def export_html(self) -> None:
         if not self.results and not self.fleet_rows:
             messagebox.showinfo("Export", "Nothing to export yet.", parent=self)
             return
         host = self.results[-1].host if self.results else "fleet"
         path = filedialog.asksaveasfilename(parent=self, title="Save HTML report", defaultextension=".html",
+                                            initialdir=self._export_initial_dir(),
                                             initialfile=f"E6000_{host}_{datetime.now():%Y%m%d_%H%M%S}.html",
                                             filetypes=[("HTML", "*.html")])
         if not path:
             return
+        self.st["export_dir"] = str(Path(path).parent)
         img = ""
         if self.fig is not None or self.last_parsed:
             try:
@@ -3267,10 +3291,12 @@ class CommandCenter(ctk.CTk):
             return
         host = self.results[-1].host if self.results else "fleet"
         path = filedialog.asksaveasfilename(parent=self, title="Save workbook", defaultextension=".xlsx",
+                                            initialdir=self._export_initial_dir(),
                                             initialfile=f"E6000_{host}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
                                             filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
+        self.st["export_dir"] = str(Path(path).parent)
         try:
             build_workbook(self).save(path)
             self._set_activity(f"Workbook saved: {path}", "ok")
@@ -3299,12 +3325,9 @@ class CommandCenter(ctk.CTk):
             messagebox.showinfo("Export", f"The {view} view is empty - nothing to export.", parent=self)
             return
         host = self.connected_host or (self.results[-1].host if self.results else "") or "E6000"
-        init_dir = self.st.get("export_dir") or ""
-        if not init_dir or not Path(init_dir).is_dir():
-            init_dir = str(Path.home())
         path = filedialog.asksaveasfilename(
             parent=self, title=f"Save {view.lower()} output as Excel", defaultextension=".xlsx",
-            initialdir=init_dir, initialfile=f"E6000_{host}_{view.lower()}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            initialdir=self._export_initial_dir(), initialfile=f"E6000_{host}_{view.lower()}_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
             filetypes=[("Excel workbook", "*.xlsx")])
         if not path:
             return
