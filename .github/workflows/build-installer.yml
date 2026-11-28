@@ -16,6 +16,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -50,9 +51,13 @@ jobs:
           $exe   = "$dir\CMTS_Command_Center.exe"
           $log   = "$env:RUNNER_TEMP\install.log"
 
+          # Wait for Setup itself only. Start-Process -Wait also waits for child processes,
+          # which hangs when Setup reopens the app (/RELAUNCH=1).
           function Install([string[]]$extra) {
-            $p = Start-Process $setup -ArgumentList (@('/VERYSILENT','/SUPPRESSMSGBOXES','/ALLUSERS','/NORESTART',"/LOG=$log") + $extra) -Wait -PassThru
+            $p = Start-Process $setup -ArgumentList (@('/VERYSILENT','/SUPPRESSMSGBOXES','/ALLUSERS','/NORESTART',"/LOG=$log") + $extra) -PassThru
+            if (-not $p.WaitForExit(300000)) { Stop-Process -Id $p.Id -Force; Get-Content $log -Tail 60; throw 'Setup timed out' }
             if ($p.ExitCode -ne 0) { Get-Content $log -Tail 60; throw "Setup exit code $($p.ExitCode)" }
+            Write-Host "ok  setup exit 0"
           }
 
           Write-Host '--- fresh install'
@@ -80,10 +85,12 @@ jobs:
           if (-not $proc) { throw 'App did not reopen after /RELAUNCH=1 upgrade' }
           Write-Host 'ok  app reopened after upgrade'
           $proc | Stop-Process -Force
+          Get-Process CMTS_Command_Center -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep 2
 
           Write-Host '--- uninstall'
-          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          $u = Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+          [void]$u.WaitForExit(120000)
           foreach ($i in 1..60) { if (-not (Test-Path $exe)) { break }; Start-Sleep 1 }
           if (Test-Path $exe) { throw 'App still present after uninstall' }
           if (Test-Path "$env:PUBLIC\Desktop\CMTS Command Center.lnk") { throw 'Desktop shortcut left after uninstall' }
