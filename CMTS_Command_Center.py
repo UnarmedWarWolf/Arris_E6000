@@ -1781,7 +1781,7 @@ class CommandCenter(ctk.CTk):
         self.after(4000, self._monitor_connection)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.log(f"{APP_NAME} {VERSION} ready. Config: {APP_DIR}")
-        if self.st.get("check_updates", True):
+        if self.st.get("check_updates", True) and not SELFTEST:
             self.after(3000, lambda: self.check_for_updates(manual=False))
 
     # ------------------------------------------------------------------ threading helpers
@@ -4256,6 +4256,63 @@ class UpdateDialog(ctk.CTkToplevel):
         self.app._on_close()
 
 
-if __name__ == "__main__":
+def run_selftest(out_path: str) -> None:
+    """Build/CI smoke test: `CMTS_Command_Center.exe --selftest result.json`.
+
+    Builds the full UI, opens and closes the Settings and Update dialogs, checks that GitHub is
+    reachable over HTTPS from the frozen app (certificates, proxy), writes a JSON report and exits.
+    Exit code 0 = pass. An unhandled error shows PyInstaller's error box instead, which CI catches
+    as a timeout."""
+    global SELFTEST
+    SELFTEST = True
+    report: dict = {"version": VERSION, "frozen": bool(getattr(sys, "frozen", False)), "checks": {}}
     app = CommandCenter()
+
+    def finish(ok: bool) -> None:
+        report["ok"] = ok
+        Path(out_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        app._on_close()
+        app.after(600, lambda: os._exit(0 if ok else 1))
+
+    def step() -> None:
+        c = report["checks"]
+        try:
+            c["icon_bundled"] = resource_path("assets/app.ico").is_file()
+            app.update_idletasks()
+            c["main_window"] = bool(app.winfo_exists()) and app.title().endswith(VERSION)
+            dlg = SettingsDialog(app)
+            app.update_idletasks()
+            dlg.destroy()
+            c["settings_dialog"] = True
+            fake = {"version": "99.0.0", "tag": "v99.0.0", "name": "v99.0.0", "notes": "self-test",
+                    "page": "", "published": "", "asset_url": "", "asset_name": "", "size": 0, "sha256": ""}
+            ud = UpdateDialog(app, fake)
+            app.update_idletasks()
+            ud._close()
+            c["update_dialog"] = True
+            try:
+                rel = fetch_latest_release(timeout=15)
+                c["github_https"] = f"ok, latest release {rel.get('tag')}"
+            except urllib.error.HTTPError as e:      # reached GitHub; e.g. 404 before the first release
+                c["github_https"] = f"ok, HTTP {e.code}"
+            except Exception as e:
+                c["github_https"] = f"FAILED: {e!r}"
+            ok = all(v is True for k, v in c.items() if k != "github_https") and \
+                str(c["github_https"]).startswith("ok")
+            finish(ok)
+        except Exception as e:
+            report["error"] = repr(e)
+            finish(False)
+
+    app.after(2500, step)
     app.mainloop()
+
+
+SELFTEST = False
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
+        run_selftest(sys.argv[2])
+    else:
+        app = CommandCenter()
+        app.mainloop()
